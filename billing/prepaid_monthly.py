@@ -16,6 +16,7 @@ class PrepaidMonthlyInvoice:
         return {
             "consumerId": consumer.consumer_id,
             "month": month,
+            "totalCharges": sum(summary.values()),
             "summary": summary,
             "closingWallet": consumer.wallet_balance,
             "closingArrear": consumer.arrear_balance
