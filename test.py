@@ -327,7 +327,7 @@ with tabs[4]:
                 b1.metric("Actual Bill Amount", f"₹{result['shadow_bill']}")
                 b2.metric("Already Deducted", f"₹{result['already_deducted']}")
                 b3.metric("Adjustment Applied", f"₹{result['adjustment']}", 
-                          delta="Credit" if result['adjustment'] < 0 else "Debit", delta_color="inverse")
+                          delta="Credit" if  result['adjustment'] < 0 else "Debit", delta_color="inverse")
                 
                 st.json(result)
         
