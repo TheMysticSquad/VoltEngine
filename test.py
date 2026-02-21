@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
-import uuid
+from datetime import datetime
 
 # ==========================================
 # 1. DATA MANAGER (In-Memory DB)
@@ -9,109 +8,181 @@ import uuid
 class DataManager:
     @staticmethod
     def init():
-        if 'consumers' not in st.session_state:
-            st.session_state.consumers = {}
-        if 'ledger' not in st.session_state:
-            st.session_state.ledger = []
-        if 'readings' not in st.session_state:
-            st.session_state.readings = [] 
-        if 'settlements' not in st.session_state:
-            st.session_state.settlements = []
+        if 'categories' not in st.session_state:
+            st.session_state.categories = {
+                "DS-II": {
+                    "cat_id": "DS-II", "name": "Domestic Rural (DS-II)", "fixed_charge": 120.0,
+                    "demand_rate": 250.0, "subsidy_rate": 1.00, "duty_rate": 0.05,
+                    "slabs": [{"Upto KWh": 50, "Rate (₹)": 3.10}, {"Upto KWh": 100, "Rate (₹)": 3.60}, {"Upto KWh": 999999, "Rate (₹)": 4.10}]
+                },
+                "NDS-I": { 
+                    "cat_id": "NDS-I", "name": "Non-Domestic Urban (NDS-I)", "fixed_charge": 250.0,
+                    "demand_rate": 400.0, "subsidy_rate": 0.00, "duty_rate": 0.08,
+                    "slabs": [{"Upto KWh": 100, "Rate (₹)": 5.50}, {"Upto KWh": 999999, "Rate (₹)": 6.50}]
+                }
+            }
+        if 'consumers' not in st.session_state: st.session_state.consumers = {}
+        if 'ledger' not in st.session_state: st.session_state.ledger = []
+        if 'readings' not in st.session_state: st.session_state.readings = []
+        if 'settlements' not in st.session_state: st.session_state.settlements = []
 
     @staticmethod
-    def save_consumer(consumer):
-        st.session_state.consumers[consumer.consumer_id] = consumer
-    
+    def get_tariff(cat_id): return st.session_state.categories.get(cat_id)
     @staticmethod
-    def get_consumer(c_id):
-        return st.session_state.consumers.get(c_id)
-
+    def save_consumer(consumer): st.session_state.consumers[consumer.consumer_id] = consumer
     @staticmethod
-    def add_reading_log(data):
-        st.session_state.readings.append(data)
-
+    def get_consumer(c_id): return st.session_state.consumers.get(c_id)
     @staticmethod
-    def add_ledger_entry(date, c_id, desc, amount, type_):
+    def add_reading_log(data): st.session_state.readings.append(data)
+    @staticmethod
+    def add_ledger_entry(date, c_id, desc, amount, type_, balance):
         st.session_state.ledger.append({
-            "Date": str(date),
-            "Consumer ID": c_id,
-            "Description": desc,
-            "Amount": float(amount),
-            "Type": type_,
+            "Date": str(date), "Consumer ID": c_id, "Description": desc,
+            "Amount (₹)": float(amount), "Type": type_, "Running Balance (₹)": float(balance),
             "Timestamp": datetime.now().strftime("%H:%M:%S")
         })
 
-    @staticmethod
-    def add_settlement(data):
-        st.session_state.settlements.append(data)
-
 # ==========================================
-# 2. CORE LOGIC
+# 2. CORE LOGIC & ENGINES
 # ==========================================
 
 class Consumer:
-    def __init__(self, consumer_id, name, address, wallet, arrear, load, installment, initial_reading):
+    def __init__(self, consumer_id, name, address, category_id, wallet, arrear, load, installment, initial_reading):
         self.consumer_id = consumer_id
         self.name = name
         self.address = address
+        self.category_id = category_id
         self.wallet_balance = float(wallet)
         self.arrear_balance = float(arrear)
         self.load_kw = float(load)
-        self.installment = installment 
+        self.installment = installment # Format: {"daily": 20.0, "recovery_days": 365}
         self.last_reading = float(initial_reading)
         self.status = "ACTIVE"
-        # Settlement Flags
-        self.last_settlement_date = None
         self.deficit_balance = 0.0
+        self.negative_days = 0 
+        self.amendments = []
+
+class PaymentEngine:
+    @staticmethod
+    def process_recharge(consumer, amount):
+        """Handles Wallet Top-ups and Auto-Reconnection logic"""
+        consumer.wallet_balance += amount
+        remarks = "Wallet Recharge"
+        
+        if consumer.wallet_balance >= 0 and consumer.status == "DISCONNECTED":
+            consumer.status = "ACTIVE"
+            consumer.negative_days = 0
+            remarks += " (Auto-Reconnected)"
+            consumer.amendments.append({"Date": datetime.now().strftime("%Y-%m-%d"), "Type": "Status", "Details": "DISCONNECTED -> ACTIVE"})
+        elif consumer.wallet_balance >= 0 and consumer.negative_days > 0:
+            consumer.negative_days = 0
+            remarks += " (Warning Reset)"
+            
+        DataManager.save_consumer(consumer)
+        DataManager.add_ledger_entry(datetime.now().date(), consumer.consumer_id, remarks, amount, "CREDIT", consumer.wallet_balance)
+        return consumer.wallet_balance
+
+    @staticmethod
+    def process_arrear_payment(consumer, amount, recovery_days):
+        """Processes partial/full arrear payments and recalculates installments."""
+        paid_amount = min(amount, consumer.arrear_balance)
+        consumer.arrear_balance -= paid_amount
+        
+        if consumer.arrear_balance > 0:
+            new_daily = round(consumer.arrear_balance / recovery_days, 2)
+            consumer.installment = {"daily": new_daily, "recovery_days": recovery_days}
+        else:
+            consumer.installment = {"daily": 0.0, "recovery_days": 0}
+            
+        DataManager.save_consumer(consumer)
+        DataManager.add_ledger_entry(datetime.now().date(), consumer.consumer_id, f"Arrear Payment Received", 0.0, "INFO", consumer.wallet_balance)
+        return paid_amount
 
 class MigrationEngine:
     @staticmethod
-    def migrate(old_acc, name, address, old_arrear, security_dep, load, closing_reading):
+    def migrate(old_acc, name, address, category_id, old_arrear, security_dep, load, closing_reading, recovery_days=365):
         net_balance = float(old_arrear) - float(security_dep)
         new_wallet = abs(net_balance) if net_balance < 0 else 0.0
         new_arrear = net_balance if net_balance > 0 else 0.0
-        inst_amt = round(new_arrear / 365, 2) if new_arrear > 0 else 0
+        inst_amt = round(new_arrear / recovery_days, 2) if new_arrear > 0 else 0
         
-        return Consumer(f"PRE-{old_acc}", name, address, new_wallet, new_arrear, load, {"daily": inst_amt}, closing_reading)
+        c = Consumer(f"PRE-{old_acc}", name, address, category_id, new_wallet, new_arrear, load, {"daily": inst_amt, "recovery_days": recovery_days}, closing_reading)
+        if new_wallet > 0:
+            DataManager.add_ledger_entry(datetime.now().date(), c.consumer_id, "Opening Balance", new_wallet, "CREDIT", new_wallet)
+        return c
+
+class SlabEngine:
+    @staticmethod
+    def calculate_energy_charge(units, slabs):
+        sorted_slabs = sorted(slabs, key=lambda x: x['Upto KWh'])
+        charge = 0.0
+        remaining_units = units
+        prev_limit = 0
+        for slab in sorted_slabs:
+            slab_size = slab['Upto KWh'] - prev_limit
+            if remaining_units <= 0: break
+            units_in_slab = min(remaining_units, slab_size)
+            charge += units_in_slab * slab['Rate (₹)']
+            remaining_units -= units_in_slab
+            prev_limit = slab['Upto KWh']
+        return charge
 
 class PrepaidDailyBilling:
-    def run(self, consumer, current_kwh, max_demand, tariff, date_str):
-        # ... (Daily Logic remains same for DCC) ...
+    def run(self, consumer, current_kwh, max_demand, date_str, is_meter_change=False):
+        tariff = DataManager.get_tariff(consumer.category_id)
+        if not tariff: return {"error": "Invalid Tariff Category"}
+
         remarks = []
         units_consumed = current_kwh - consumer.last_reading
         if units_consumed < 0: return {"error": "Negative Consumption"}
         
-        # Charges
-        ec = units_consumed * tariff['rate']
+        base_rate = min(tariff['slabs'], key=lambda x: x['Rate (₹)'])['Rate (₹)']
+        gross_ec = units_consumed * base_rate
+        subsidy = units_consumed * tariff.get('subsidy_rate', 0.0)
+        net_ec = max(0, gross_ec - subsidy)
+        
         fc = tariff['fixed_charge'] / 30.0
-        duty = (ec + fc) * tariff['duty_rate']
+        duty = (net_ec + fc) * tariff['duty_rate']
         
         penalty = 0.0
         if max_demand > consumer.load_kw:
             excess = max_demand - consumer.load_kw
             penalty = excess * tariff['demand_rate'] * 1.5 / 30.0
-            remarks.append(f"Excess Load: +{excess} KW")
+            remarks.append(f"Excess Load (+{excess}KW)")
 
         inst = 0.0
         if consumer.arrear_balance > 0:
             inst = min(consumer.installment.get('daily', 0), consumer.arrear_balance)
             if inst == consumer.arrear_balance: remarks.append("Arrear Cleared!")
 
-        total_deduction = ec + fc + duty + penalty + inst
+        total_deduction = net_ec + fc + duty + penalty + inst
         
-        # Update Consumer
         consumer.wallet_balance -= total_deduction
         consumer.arrear_balance -= inst
-        consumer.last_reading = current_kwh
+        if not is_meter_change:
+            consumer.last_reading = current_kwh
         
-        # Persist
-        DataManager.add_ledger_entry(date_str, consumer.consumer_id, "Daily Bill", -total_deduction, "DEBIT")
+        # D&R State Machine
+        if consumer.wallet_balance < 0:
+            consumer.negative_days += 1
+            if consumer.negative_days == 1: remarks.append("SMS: 1st Negative Alert")
+            elif consumer.negative_days == 2: remarks.append("SMS: 2nd Negative Alert")
+            elif consumer.negative_days == 3: remarks.append("SMS: Pre-Disconnection Notice")
+            elif consumer.negative_days == 4:
+                consumer.status = "DISCONNECTED"
+                remarks.append("ACTION: Power Disconnected")
+                consumer.amendments.append({"Date": date_str, "Type": "Status", "Details": "ACTIVE -> DISCONNECTED"})
+            else:
+                remarks.append("Status: DISCONNECTED")
+        
+        desc = "Daily DCC Bill" if not is_meter_change else "Meter Changeout Final Bill"
+        DataManager.add_ledger_entry(date_str, consumer.consumer_id, desc, -total_deduction, "DEBIT", consumer.wallet_balance)
         
         log_entry = {
-            "Date": date_str, "Consumer ID": consumer.consumer_id, "Reading (KWh)": current_kwh,
-            "Units Consumed": units_consumed, "EC (Energy)": round(ec, 2), "FC (Fixed)": round(fc, 2),
-            "Duty": round(duty, 2), "Excess MD Charge": round(penalty, 2), "Installment": round(inst, 2),
-            "Total Charges": round(total_deduction, 2), "Wallet Balance": round(consumer.wallet_balance, 2),
+            "Date": date_str, "Consumer ID": consumer.consumer_id, "Units": units_consumed, "Max MD": max_demand,
+            "Gross EC": round(gross_ec, 2), "Subsidy": round(subsidy, 2), "Net EC": round(net_ec, 2), 
+            "FC": round(fc, 2), "Duty": round(duty, 2), "Excess MD": round(penalty, 2), "Inst": round(inst, 2),
+            "Total": round(total_deduction, 2), "Wallet": round(consumer.wallet_balance, 2),
             "Remarks": ", ".join(remarks) if remarks else "-"
         }
         DataManager.add_reading_log(log_entry)
@@ -119,240 +190,203 @@ class PrepaidDailyBilling:
         return log_entry
 
 class MonthlySettlementEngine:
-    """
-    Implements the Production-Grade Logic:
-    1. Identify Eligible Consumers (Active)
-    2. Fetch Meter Data (First & Last Reading of Month)
-    3. Calculate Monthly Charges (Shadow Bill)
-    4. Wallet Adjustment (True-Up vs Daily)
-    5. Sync & Close
-    """
     @staticmethod
-    def run_settlement(consumer, month_str, tariff):
-        # Step 2: Fetch Meter Data (Simulated from logs)
-        logs = st.session_state.readings
-        # Filter logs for this consumer and month
-        month_logs = [l for l in logs if l['Consumer ID'] == consumer.consumer_id and month_str in str(l['Date'])]
-        
-        if not month_logs:
-            return {"status": "FAILED", "reason": "No reading data for this month"}
+    def run_settlement(consumer, month_str):
+        tariff = DataManager.get_tariff(consumer.category_id)
+        logs = [l for l in st.session_state.readings if l['Consumer ID'] == consumer.consumer_id and month_str in str(l['Date'])]
+        if not logs: return {"status": "FAILED", "reason": "No logs for month"}
             
-        # Sort by date
-        month_logs.sort(key=lambda x: x['Date'])
+        total_units = sum(l['Units'] for l in logs)
         
-        start_read = month_logs[0]['Reading (KWh)'] - month_logs[0]['Units Consumed'] # Infer start
-        end_read = month_logs[-1]['Reading (KWh)']
-        total_consumption = end_read - start_read
+        gross_ec = SlabEngine.calculate_energy_charge(total_units, tariff['slabs'])
+        total_subsidy = total_units * tariff.get('subsidy_rate', 0.0)
+        net_ec = max(0, gross_ec - total_subsidy)
         
-        # Step 3: Calculate Monthly Charges (Shadow Bill)
-        # Apply Monthly Slab Logic (Example: 0-100 @ 3.0, >100 @ 5.0)
-        energy_charge = 0
-        if total_consumption <= 100:
-            energy_charge = total_consumption * 3.0
-        else:
-            energy_charge = (100 * 3.0) + ((total_consumption - 100) * 5.0)
-            
-        fixed_charge = tariff['fixed_charge'] # Full Monthly FC
-        duty = (energy_charge + fixed_charge) * tariff['duty_rate']
+        fixed_charge = tariff['fixed_charge']
+        duty = (net_ec + fixed_charge) * tariff['duty_rate']
         
-        # Sum of penalties/installments already captured in daily logs
-        total_penalties = sum(l['Excess MD Charge'] for l in month_logs)
-        total_installments = sum(l['Installment'] for l in month_logs)
+        shadow_bill = net_ec + fixed_charge + duty
+        daily_deducted = sum(l['Net EC'] + l['FC'] + l['Duty'] for l in logs)
+        adjustment = shadow_bill - daily_deducted
         
-        shadow_bill_amount = energy_charge + fixed_charge + duty + total_penalties + total_installments
-        
-        # Step 4: Wallet Adjustment (True-Up)
-        # We compare Shadow Bill vs What was already deducted daily
-        already_deducted = sum(l['Total Charges'] for l in month_logs)
-        adjustment_needed = shadow_bill_amount - already_deducted
-        
-        settlement_status = "SUCCESS"
-        
-        # Apply Adjustment
-        if adjustment_needed != 0:
-            # Case A: Sufficient Balance (or tiny adjustment)
-            if consumer.wallet_balance >= adjustment_needed:
-                consumer.wallet_balance -= adjustment_needed
-            # Case B: Insufficient Balance (Deficit Logic)
+        status = "SUCCESS"
+        if adjustment != 0:
+            if consumer.wallet_balance >= adjustment:
+                consumer.wallet_balance -= adjustment
             else:
-                deficit = adjustment_needed - consumer.wallet_balance
+                consumer.deficit_balance += (adjustment - consumer.wallet_balance)
                 consumer.wallet_balance = 0
-                consumer.deficit_balance += deficit
-                settlement_status = "DEFICIT"
+                status = "DEFICIT"
                 
-            # Log the adjustment
-            type_ = "DEBIT" if adjustment_needed > 0 else "CREDIT"
-            DataManager.add_ledger_entry(
-                datetime.now().strftime("%Y-%m-%d"), 
-                consumer.consumer_id, 
-                f"Monthly Settlement Adj ({month_str})", 
-                -adjustment_needed, 
-                type_
-            )
+            type_ = "DEBIT" if adjustment > 0 else "CREDIT"
+            DataManager.add_ledger_entry(datetime.now().strftime("%Y-%m-%d"), consumer.consumer_id, 
+                                         f"Monthly True-Up ({month_str})", -adjustment, type_, consumer.wallet_balance)
 
-        # Step 5: Snapshot & Close
-        consumer.last_settlement_date = datetime.now().strftime("%Y-%m-%d")
         DataManager.save_consumer(consumer)
-        
-        result = {
-            "month": month_str,
-            "consumer_id": consumer.consumer_id,
-            "consumption": total_consumption,
-            "shadow_bill": round(shadow_bill_amount, 2),
-            "already_deducted": round(already_deducted, 2),
-            "adjustment": round(adjustment_needed, 2),
-            "final_wallet": round(consumer.wallet_balance, 2),
-            "deficit": round(consumer.deficit_balance, 2),
-            "status": settlement_status
+        res = {
+            "month": month_str, "consumer_id": consumer.consumer_id, "units": total_units,
+            "shadow_bill": round(shadow_bill, 2), "daily_deducted": round(daily_deducted, 2),
+            "adjustment": round(adjustment, 2), "status": status
         }
-        DataManager.add_settlement(result)
-        return result
+        st.session_state.settlements.append(res)
+        return res
 
 # ==========================================
 # 3. STREAMLIT UI
 # ==========================================
-
-st.set_page_config(page_title="VoltEngine Enterprise", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="VoltEngine Pro", layout="wide", page_icon="⚡")
 DataManager.init()
 
-st.title("⚡ VoltEngine: Enterprise Billing")
+st.title("⚡ VoltEngine: Billing & Recovery Simulator")
 
-# Sidebar
-st.sidebar.header("Navigation")
 active_consumers = list(st.session_state.consumers.keys())
-selected_c_id = st.sidebar.selectbox("Select Consumer", options=["Select"] + active_consumers)
+selected_c_id = st.sidebar.selectbox("Active Consumer", ["Select"] + active_consumers)
 
-# Tabs
-tabs = st.tabs([
-    "🔄 Migration", 
-    "👤 Profile", 
-    "📟 Reading Entry", 
-    "📊 Daily Charge (DCC)", 
-    "📅 Monthly Settlement", 
-    "💰 Recharge"
-])
+tabs = st.tabs(["⚙️ Masters", "🔄 Migration", "👤 Profile", "🛠️ Services", "📟 Readings", "📊 DCC & Ledger", "💰 Financial Desk", "📅 Settlement"])
 
-# --- TAB 1: MIGRATION ---
+# --- TAB 1: CATEGORY ---
 with tabs[0]:
-    st.header("Legacy Migration Utility")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        old_acc = st.text_input("Old Account No", "KNO-998877")
-        name = st.text_input("Name", "Ramesh Kumar")
-    with col2:
-        old_arrear = st.number_input("Arrears (₹)", value=5000.0)
-        sec_dep = st.number_input("Security Deposit (₹)", value=1500.0)
-    with col3:
-        load = st.number_input("Load (KW)", value=5.0)
-        close_read = st.number_input("Closing Reading", value=1000.0)
-        
-    if st.button("Migrate to Prepaid"):
-        c = MigrationEngine.migrate(old_acc, name, "Patna, Bihar", old_arrear, sec_dep, load, close_read)
-        DataManager.save_consumer(c)
-        st.success(f"Migrated! New ID: {c.consumer_id}")
+    st.write("Active Tariff Categories (Includes NDS)")
+    for key, val in st.session_state.categories.items():
+        with st.expander(f"{val['name']} ({key})"):
+            st.json(val)
 
-# --- TAB 2: PROFILE ---
+# --- TAB 2: MIGRATION ---
 with tabs[1]:
-    if selected_c_id != "Select":
-        c = DataManager.get_consumer(selected_c_id)
-        st.header(f"Consumer: {c.name} ({c.consumer_id})")
-        
-        with st.container():
-            c1, c2, c3 = st.columns(3)
-            c1.markdown(f"**Status:** :green[{c.status}]")
-            c1.markdown(f"**Load:** {c.load_kw} KW")
-            c2.markdown(f"**Last Read:** {c.last_reading} KWh")
-            c2.markdown(f"**Daily Inst:** ₹{c.installment.get('daily',0)}")
-            
-            c3.metric("Wallet Balance", f"₹{c.wallet_balance:.2f}")
-            if c.deficit_balance > 0:
-                c3.error(f"Deficit: ₹{c.deficit_balance:.2f}")
-            c3.markdown(f"**Arrears:** ₹{c.arrear_balance:.2f}")
-    else:
-        st.info("Select a consumer.")
-
-# --- TAB 3: READING ---
-with tabs[2]:
-    st.header("Daily Reading Entry")
-    if selected_c_id != "Select":
-        c = DataManager.get_consumer(selected_c_id)
-        col1, col2 = st.columns(2)
-        r_date = col1.date_input("Date", datetime.today())
-        curr_read = col2.number_input("Current Reading", min_value=c.last_reading, value=c.last_reading + 10)
-        max_md = col2.number_input("MD (KW)", value=4.0)
-        
-        if st.button("Calculate Daily Bill"):
-            tariff = {"rate": 3.0, "fixed_charge": 120, "duty_rate": 0.05, "demand_rate": 250}
-            engine = PrepaidDailyBilling()
-            res = engine.run(c, curr_read, max_md, tariff, str(r_date))
-            if "error" not in res: st.success("Deducted Successfully!")
-    else:
-        st.warning("Select Consumer")
-
-# --- TAB 4: DCC ---
-with tabs[3]:
-    st.header("Daily Charge Sheet")
-    if selected_c_id != "Select":
-        c_logs = [l for l in st.session_state.readings if l['Consumer ID'] == selected_c_id]
-        if c_logs:
-            df = pd.DataFrame(c_logs)
-            cols = ["Date", "Reading (KWh)", "EC (Energy)", "FC (Fixed)", "Total Charges", "Wallet Balance", "Remarks"]
-            st.dataframe(df[cols], width="stretch")
-        else:
-            st.info("No Data")
-
-# --- TAB 5: MONTHLY SETTLEMENT (NEW LOGIC) ---
-with tabs[4]:
-    st.header("Monthly Settlement & Sync")
-    st.info("Reconciles Daily Deductions against Actual Monthly Bill (Shadow Bill).")
+    c1, c2, c3 = st.columns(3)
+    acc = c1.text_input("Old Acc", "KNO-001")
+    cat = c1.selectbox("Category", list(st.session_state.categories.keys()))
+    arr = c2.number_input("Arrears", 3000.0)
+    sec = c2.number_input("Security Dep", 1000.0)
+    ld = c3.number_input("Load (KW)", 2.0)
+    rd = c3.number_input("Closing Read", 500.0)
     
-    if selected_c_id != "Select":
-        col1, col2 = st.columns(2)
-        month_sel = col1.selectbox("Select Month", ["2026-01", "2026-02", "2026-03"])
-        
-        if st.button("Run Settlement Batch"):
-            c = DataManager.get_consumer(selected_c_id)
-            tariff = {"fixed_charge": 120, "duty_rate": 0.05} # Base tariff
-            
-            result = MonthlySettlementEngine.run_settlement(c, month_sel, tariff)
-            
-            if result.get("status") == "FAILED":
-                st.error(result["reason"])
-            else:
-                st.success("Settlement Completed Successfully!")
-                
-                # Visual Bill Representation
-                st.subheader("🧾 Shadow Bill Summary")
-                b1, b2, b3 = st.columns(3)
-                b1.metric("Actual Bill Amount", f"₹{result['shadow_bill']}")
-                b2.metric("Already Deducted", f"₹{result['already_deducted']}")
-                b3.metric("Adjustment Applied", f"₹{result['adjustment']}", 
-                          delta="Credit" if  result['adjustment'] < 0 else "Debit", delta_color="inverse")
-                
-                st.json(result)
-        
-        # Show Settlement History
-        st.markdown("---")
-        st.subheader("Settlement History")
-        hist = [s for s in st.session_state.settlements if s['consumer_id'] == selected_c_id]
-        if hist:
-            st.dataframe(pd.DataFrame(hist), width="stretch")
+    if st.button("Migrate"):
+        c = MigrationEngine.migrate(acc, "John Doe", "Bihar", cat, arr, sec, ld, rd)
+        DataManager.save_consumer(c)
+        st.success(f"Migrated: {c.consumer_id}")
 
-# --- TAB 6: RECHARGE ---
-with tabs[5]:
-    st.header("Recharge")
+# --- TAB 3: PROFILE ---
+with tabs[2]:
     if selected_c_id != "Select":
         c = DataManager.get_consumer(selected_c_id)
-        amt = st.number_input("Amount", value=500.0)
-        if st.button("Recharge"):
-            c.wallet_balance += amt
-            # Clear deficit first if exists
-            if c.deficit_balance > 0:
-                recov = min(c.wallet_balance, c.deficit_balance)
-                c.wallet_balance -= recov
-                c.deficit_balance -= recov
-                st.warning(f"₹{recov} used to clear previous deficit.")
+        st.header("Consumer Profile")
+        colA, colB, colC, colD = st.columns(4)
+        colA.markdown(f"**Category:** {c.category_id}")
+        colA.markdown(f"**Load:** {c.load_kw} KW")
+        colB.metric("Wallet", f"₹{c.wallet_balance:.2f}")
+        colB.metric("Arrear", f"₹{c.arrear_balance:.2f}")
+        
+        status_color = "green" if c.status == "ACTIVE" else "red"
+        colC.markdown(f"**Status:** :{status_color}[{c.status}]")
+        colC.markdown(f"**Negative Days:** {c.negative_days}")
+        
+        colD.markdown("**Installment Plan:**")
+        colD.info(f"₹{c.installment.get('daily', 0)}/day ({c.installment.get('recovery_days', 0)} days left)")
+
+        if c.amendments:
+            st.subheader("📝 Amendment & Event History")
+            st.dataframe(pd.DataFrame(c.amendments), width="stretch")
+
+# --- TAB 4: SERVICES ---
+with tabs[3]:
+    if selected_c_id != "Select":
+        c = DataManager.get_consumer(selected_c_id)
+        st.header("Service Requests (Amendments)")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("1. Master Data Change")
+            new_load = st.number_input("New Load (KW)", value=c.load_kw)
+            new_cat = st.selectbox("New Category", list(st.session_state.categories.keys()), index=list(st.session_state.categories.keys()).index(c.category_id))
+            
+            if st.button("Apply Master Data Change"):
+                if new_load != c.load_kw or new_cat != c.category_id:
+                    c.amendments.append({"Date": datetime.now().strftime("%Y-%m-%d %H:%M"), "Type": "Master Data", "Details": f"{c.load_kw}KW/{c.category_id} -> {new_load}KW/{new_cat}"})
+                    c.load_kw, c.category_id = new_load, new_cat
+                    DataManager.save_consumer(c)
+                    st.success("Updated! Next DCC will use new parameters.")
+
+        with col2:
+            st.subheader("2. Meter Replacement (MCO)")
+            final_read = st.number_input("Final Reading of OLD Meter", min_value=c.last_reading, value=c.last_reading + 5)
+            initial_read = st.number_input("Initial Reading of NEW Meter", value=0.0)
+            mco_date = st.date_input("MCO Date")
+            
+            if st.button("Execute Meter Replacement"):
+                res = PrepaidDailyBilling().run(c, final_read, c.load_kw, str(mco_date), is_meter_change=True)
+                if "error" not in res:
+                    c.last_reading = initial_read
+                    c.amendments.append({"Date": str(mco_date), "Type": "Meter Replacement", "Details": f"Old Final: {final_read} | New Initial: {initial_read}"})
+                    DataManager.save_consumer(c)
+                    st.success("Meter Replaced! Final bill generated and new reading initialized.")
+
+# --- TAB 5: READINGS ---
+with tabs[4]:
+    if selected_c_id != "Select":
+        c = DataManager.get_consumer(selected_c_id)
+        col1, col2 = st.columns(2)
+        r_date = col1.date_input("Date")
+        curr_read = col2.number_input("Reading", min_value=c.last_reading, value=c.last_reading + 8)
+        max_md = col2.number_input("Max Demand", value=c.load_kw)
+        
+        if st.button("Run DCC"):
+            res = PrepaidDailyBilling().run(c, curr_read, max_md, str(r_date))
+            if "error" not in res: st.success("DCC Processed!")
+
+# --- TAB 6: DCC & LEDGER ---
+with tabs[5]:
+    if selected_c_id != "Select":
+        dcc_tab, ledger_tab = st.tabs(["📊 Detailed DCC View", "📒 Financial Ledger"])
+        
+        with dcc_tab:
+            c_logs = [l for l in st.session_state.readings if l['Consumer ID'] == selected_c_id]
+            if c_logs: st.dataframe(pd.DataFrame(c_logs), width="stretch")
+            
+        with ledger_tab:
+            c_ledg = [l for l in st.session_state.ledger if l['Consumer ID'] == selected_c_id]
+            if c_ledg:
+                df_ledg = pd.DataFrame(c_ledg)
+                def color_type(val):
+                    color = 'green' if val == 'CREDIT' else 'red' if val == 'DEBIT' else 'gray'
+                    return f'color: {color}'
+                st.dataframe(df_ledg.style.map(color_type, subset=['Type']), width="stretch")
+
+# --- TAB 7: FINANCIAL DESK ---
+with tabs[6]:
+    st.header("Financial Desk")
+    if selected_c_id != "Select":
+        c = DataManager.get_consumer(selected_c_id)
+        pay_type = st.radio("Payment Type", ["Wallet Recharge", "Arrear Clearance"])
+        
+        if pay_type == "Wallet Recharge":
+            st.subheader("Top-Up Wallet (Auto-Reconnects if Disconnected)")
+            st.write(f"Current Wallet: ₹{c.wallet_balance:.2f}")
+            w_amt = st.number_input("Recharge Amount (₹)", value=500.0)
+            if st.button("Process Recharge"):
+                PaymentEngine.process_recharge(c, w_amt)
+                st.success(f"Recharged! New Wallet: ₹{c.wallet_balance:.2f}")
                 
-            DataManager.save_consumer(c)
-            DataManager.add_ledger_entry(str(datetime.now().date()), c.consumer_id, "Recharge", amt, "CREDIT")
-            st.success(f"New Balance: ₹{c.wallet_balance}")
+        elif pay_type == "Arrear Clearance":
+            st.subheader("Restructure Installment & Clear Arrears")
+            st.error(f"Total Outstanding Arrear: ₹{c.arrear_balance:.2f}")
+            
+            a_amt = st.number_input("Payment Amount (₹)", max_value=c.arrear_balance, value=min(1000.0, c.arrear_balance))
+            st.markdown("### Installment Table Logic (Post-Payment)")
+            rec_days = st.slider("New Recovery Period (Days) for Remaining Arrear", min_value=30, max_value=730, value=365)
+            
+            projected_remaining = c.arrear_balance - a_amt
+            projected_daily = projected_remaining / rec_days if projected_remaining > 0 else 0
+            st.info(f"If you pay ₹{a_amt} today, the remaining arrear (₹{projected_remaining:.2f}) will trigger a new daily deduction of **₹{projected_daily:.2f}/day**.")
+            
+            if st.button("Process Arrear Payment"):
+                paid = PaymentEngine.process_arrear_payment(c, a_amt, rec_days)
+                st.success(f"Successfully processed ₹{paid} towards arrears. New daily installment set to ₹{c.installment['daily']}.")
+
+# --- TAB 8: SETTLEMENT ---
+with tabs[7]:
+    if selected_c_id != "Select":
+        m_sel = st.selectbox("Month", ["2026-02", "2026-03"])
+        if st.button("Run Monthly Settlement"):
+            res = MonthlySettlementEngine.run_settlement(DataManager.get_consumer(selected_c_id), m_sel)
+            st.json(res)
