@@ -55,17 +55,15 @@ class Consumer:
         self.wallet_balance = float(wallet)
         self.arrear_balance = float(arrear)
         self.load_kw = float(load)
-        self.installment = installment # Format: {"daily": 20.0, "recovery_days": 365}
+        self.installment = installment 
         self.last_reading = float(initial_reading)
         self.status = "ACTIVE"
-        self.deficit_balance = 0.0
         self.negative_days = 0 
         self.amendments = []
 
 class PaymentEngine:
     @staticmethod
     def process_recharge(consumer, amount):
-        """Handles Wallet Top-ups and Auto-Reconnection logic"""
         consumer.wallet_balance += amount
         remarks = "Wallet Recharge"
         
@@ -84,7 +82,6 @@ class PaymentEngine:
 
     @staticmethod
     def process_arrear_payment(consumer, amount, recovery_days):
-        """Processes partial/full arrear payments and recalculates installments."""
         paid_amount = min(amount, consumer.arrear_balance)
         consumer.arrear_balance -= paid_amount
         
@@ -162,7 +159,6 @@ class PrepaidDailyBilling:
         if not is_meter_change:
             consumer.last_reading = current_kwh
         
-        # D&R State Machine
         if consumer.wallet_balance < 0:
             consumer.negative_days += 1
             if consumer.negative_days == 1: remarks.append("SMS: 1st Negative Alert")
@@ -211,12 +207,8 @@ class MonthlySettlementEngine:
         
         status = "SUCCESS"
         if adjustment != 0:
-            if consumer.wallet_balance >= adjustment:
-                consumer.wallet_balance -= adjustment
-            else:
-                consumer.deficit_balance += (adjustment - consumer.wallet_balance)
-                consumer.wallet_balance = 0
-                status = "DEFICIT"
+            consumer.wallet_balance -= adjustment
+            status = "SUCCESS" if consumer.wallet_balance >= 0 else "DEFICIT"
                 
             type_ = "DEBIT" if adjustment > 0 else "CREDIT"
             DataManager.add_ledger_entry(datetime.now().strftime("%Y-%m-%d"), consumer.consumer_id, 
@@ -386,7 +378,10 @@ with tabs[6]:
 # --- TAB 8: SETTLEMENT ---
 with tabs[7]:
     if selected_c_id != "Select":
-        m_sel = st.selectbox("Month", ["2026-02", "2026-03"])
+        current_date = datetime.now()
+        dynamic_months = [(current_date - pd.DateOffset(months=i)).strftime("%Y-%m") for i in range(6)]
+        m_sel = st.selectbox("Month", dynamic_months)
+        
         if st.button("Run Monthly Settlement"):
             res = MonthlySettlementEngine.run_settlement(DataManager.get_consumer(selected_c_id), m_sel)
             st.json(res)
