@@ -10,62 +10,212 @@ try:
 except ImportError:
     HAS_FPDF = False
     FPDF = None
+import tempfile
+import os
 
 # ==========================================
-# 0. PDF GENERATOR UTILITY
+# 0. PDF GENERATOR UTILITY (FILE-BUFFER FIX)
 # ==========================================
 class PDFGenerator:
     @staticmethod
-    def create_bill(title, consumer, details_dict, financial_dict):
-        if not HAS_FPDF:
-            return "Error: FPDF not installed. Run 'pip install fpdf'".encode('utf-8')
+    def _draw_section_header(pdf, title):
+        pdf.set_font("Arial", 'B', 11)
+        pdf.set_fill_color(32, 74, 135) # Dark Blue
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(190, 8, f"  {title}", border=1, ln=True, fill=True)
+        pdf.set_text_color(0, 0, 0)
+
+    @staticmethod
+    def _draw_row(pdf, col1, col2, col3="", col4="", is_bold=False, fill=False):
+        pdf.set_font("Arial", 'B' if is_bold else '', 10)
+        if fill: pdf.set_fill_color(240, 240, 240)
+        
+        if col3 == "" and col4 == "":
+            pdf.cell(140, 7, f"  {col1}", border=1, fill=fill)
+            pdf.cell(50, 7, f"{col2}  ", border=1, ln=True, align='R', fill=fill)
+        else:
+            pdf.cell(70, 7, f"  {col1}", border=1, fill=fill)
+            pdf.cell(40, 7, f"{col2}  ", border=1, align='R', fill=fill)
+            pdf.cell(40, 7, f"{col3}  ", border=1, align='R', fill=fill)
+            pdf.cell(40, 7, f"{col4}  ", border=1, ln=True, align='R', fill=fill)
+
+    @staticmethod
+    def _get_clean_pdf_bytes(pdf):
+        """Bulletproof method to extract PDF bytes without encoding corruption."""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            temp_path = tmp.name
             
+        try:
+            # Let FPDF write to a physical file natively
+            try:
+                pdf.output(temp_path)
+            except Exception:
+                pdf.output(name=temp_path, dest='F')
+                
+            # Read the clean binary data
+            with open(temp_path, "rb") as f:
+                pdf_bytes = f.read()
+                
+            return pdf_bytes
+            
+        finally:
+            # The 'finally' block GUARANTEES the file is deleted from the 
+            # cloud server, even if the code crashes on the line above!
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    @staticmethod
+    def generate_conversion_bill(consumer, details):
+        if not HAS_FPDF: return b"FPDF not installed."
         pdf = FPDF()
         pdf.add_page()
         
-        # Header
+        # --- HEADER ---
         pdf.set_font("Arial", 'B', 16)
-        pdf.cell(0, 10, "VOLT-ENGINE DISCOM UTILITY", ln=True, align='C')
+        pdf.set_text_color(32, 74, 135)
+        pdf.cell(0, 10, "VOLTENGINE DISCOM UTILITY", ln=True, align='C')
         pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 10, title, ln=True, align='C')
+        pdf.cell(0, 8, "POSTPAID TO PREPAID CONVERSION BILL", ln=True, align='C')
+        pdf.set_text_color(0, 0, 0)
         pdf.ln(5)
         
-        # Consumer Info
-        pdf.set_font("Arial", 'B', 11)
-        pdf.cell(0, 8, "CONSUMER DETAILS", border="B", ln=True)
-        pdf.set_font("Arial", '', 11)
-        pdf.cell(0, 6, f"Consumer ID : {consumer.consumer_id}", ln=True)
-        pdf.cell(0, 6, f"Name        : {consumer.name}", ln=True)
-        pdf.cell(0, 6, f"Category    : {consumer.category_id} | Load: {consumer.load_kw} KW", ln=True)
+        # --- CONSUMER DETAILS ---
+        pdf.set_font("Arial", '', 10)
+        pdf.cell(40, 7, "Consumer ID:", border=1)
+        pdf.cell(150, 7, f" {consumer.consumer_id}", border=1, ln=True)
+        pdf.cell(40, 7, "Consumer Name:", border=1)
+        pdf.cell(150, 7, f" {consumer.name}", border=1, ln=True)
+        pdf.cell(40, 7, "Address:", border=1)
+        pdf.cell(150, 7, f" {consumer.address}", border=1, ln=True)
+        pdf.cell(40, 7, "Category & Load:", border=1)
+        pdf.cell(150, 7, f" {consumer.category_id} | {consumer.load_kw} KW", border=1, ln=True)
+        pdf.cell(40, 7, "Migration Date:", border=1)
+        pdf.cell(150, 7, f" {details['mig_date']}", border=1, ln=True)
         pdf.ln(5)
         
-        # Bill Details
-        pdf.set_font("Arial", 'B', 11)
-        pdf.cell(0, 8, "BILLING DETAILS", border="B", ln=True)
-        pdf.set_font("Arial", '', 11)
-        for k, v in details_dict.items():
-            pdf.cell(0, 6, f"{k:<30}: {v}", ln=True)
-        pdf.ln(5)
+        # --- SECTION A: UNBILLED PERIOD ---
+        PDFGenerator._draw_section_header(pdf, "A. UNBILLED PERIOD CALCULATION")
+        PDFGenerator._draw_row(pdf, "Previous Billed Reading", details['prev_r'])
+        PDFGenerator._draw_row(pdf, "Migration Day Reading", details['mig_r'], fill=True)
+        PDFGenerator._draw_row(pdf, "Units for Unbilled Period", details['units'], is_bold=True)
         
-        # Financials
-        pdf.set_font("Arial", 'B', 11)
-        pdf.cell(0, 8, "FINANCIAL SUMMARY", border="B", ln=True)
-        pdf.set_font("Arial", '', 11)
-        for k, v in financial_dict.items():
-            pdf.cell(0, 6, f"{k:<30}: Rs. {v}", ln=True)
+        pdf.set_font("Arial", 'B', 10)
+        pdf.set_fill_color(220, 220, 220)
+        pdf.cell(190, 7, "  Detail Breakdown:", border=1, ln=True, fill=True)
+        
+        for slab in details['slab_breakdown']:
+            PDFGenerator._draw_row(pdf, f"   {slab['desc']}", f"Rs. {slab['charge']:.2f}")
             
-        pdf.ln(10)
-        pdf.set_font("Arial", 'I', 9)
-        pdf.cell(0, 6, f"Generated automatically by VoltEngine on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align='C')
-        
-        # Handle fpdf 1.x vs 2.x output differences safely
-        try:
-            return pdf.output(dest='S').encode('latin-1')
-        except TypeError:
-            return bytes(pdf.output())
+        PDFGenerator._draw_row(pdf, "Gross Energy Charge:", f"Rs. {details['gross_ec']:.2f}", is_bold=True, fill=True)
+        PDFGenerator._draw_row(pdf, "Less: Subsidy:", f"-Rs. {details['subsidy']:.2f}")
+        PDFGenerator._draw_row(pdf, "Fixed Charges (Prorated):", f"Rs. {details['fc']:.2f}")
+        PDFGenerator._draw_row(pdf, "Electricity Duty:", f"Rs. {details['duty']:.2f}")
+        PDFGenerator._draw_row(pdf, "DPS (Delayed Payment Surcharge):", "Rs. 0.00")
+        PDFGenerator._draw_row(pdf, "Total Unbilled Amount:", f"Rs. {details['total_unbilled']:.2f}", is_bold=True, fill=True)
+        pdf.ln(5)
 
+        # --- SECTION B: RECONCILIATION ---
+        PDFGenerator._draw_section_header(pdf, "B. ACCOUNT RECONCILIATION")
+        PDFGenerator._draw_row(pdf, "Old Arrear:", f"Rs. {details['old_arrear']:.2f}")
+        PDFGenerator._draw_row(pdf, "Add: Unbilled Amount:", f"Rs. {details['total_unbilled']:.2f}")
+        total_out = details['old_arrear'] + details['total_unbilled']
+        PDFGenerator._draw_row(pdf, "Total Outstanding:", f"Rs. {total_out:.2f}", is_bold=True, fill=True)
+        PDFGenerator._draw_row(pdf, "Less: Security Deposit:", f"-Rs. {details['sec_dep']:.2f}")
+        
+        # Highlighted final balances
+        pdf.set_font("Arial", 'B', 11)
+        pdf.set_fill_color(32, 74, 135)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(140, 8, "  OPENING ARREAR (Prepaid):", border=1, fill=True)
+        pdf.cell(50, 8, f"Rs. {consumer.arrear_balance:.2f}  ", border=1, ln=True, align='R', fill=True)
+        pdf.cell(140, 8, "  OPENING WALLET BALANCE:", border=1, fill=True)
+        pdf.cell(50, 8, f"Rs. {consumer.wallet_balance:.2f}  ", border=1, ln=True, align='R', fill=True)
+        pdf.set_text_color(0, 0, 0)
+        
+        pdf.ln(5)
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(190, 6, "Remarks:", ln=True)
+        pdf.set_font("Arial", '', 10)
+        pdf.cell(190, 6, f"   * Recovery Days: {details['rec_days']} Days", ln=True)
+        pdf.cell(190, 6, f"   * Installment Per Day: Rs. {consumer.installment.get('daily', 0):.2f}", ln=True)
+
+        # Call the new clean bytes method
+        return PDFGenerator._get_clean_pdf_bytes(pdf)
+
+    @staticmethod
+    def generate_settlement_bill(consumer, res):
+        if not HAS_FPDF: return b"FPDF not installed."
+        pdf = FPDF()
+        pdf.add_page()
+        
+        # --- HEADER ---
+        pdf.set_font("Arial", 'B', 16)
+        pdf.set_text_color(32, 74, 135)
+        pdf.cell(0, 10, "VOLTENGINE DISCOM", ln=True, align='C')
+        pdf.set_font("Arial", 'B', 12)
+        pdf.cell(0, 8, "MONTHLY PREPAID SETTLEMENT INVOICE", ln=True, align='C')
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+        
+        # Metadata table
+        pdf.set_font("Arial", '', 10)
+        pdf.cell(95, 7, f" Billing Month : {res['month']}", border=1)
+        pdf.cell(95, 7, f" Invoice Date : {datetime.now().strftime('%d-%m-%Y')}", border=1, ln=True)
+        pdf.cell(95, 7, f" Consumer ID : {consumer.consumer_id}", border=1)
+        pdf.cell(95, 7, f" Category : {consumer.category_id} | Load: {consumer.load_kw}KW", border=1, ln=True)
+        pdf.ln(5)
+
+        # --- SECTION A: ACTUAL MONTHLY CHARGES ---
+        PDFGenerator._draw_section_header(pdf, "A. ACTUAL MONTHLY CHARGES (SHADOW BILL)")
+        PDFGenerator._draw_row(pdf, "Total Units (KWh)", f"{res['units']} KWh", is_bold=True, fill=True)
+        PDFGenerator._draw_row(pdf, "Gross Energy Charge", f"Rs. {res['gross_ec']:.2f}")
+        PDFGenerator._draw_row(pdf, "Less: Govt Subsidy", f"-Rs. {res['subsidy']:.2f}")
+        PDFGenerator._draw_row(pdf, "Net Energy Charge", f"Rs. {res['net_ec']:.2f}", is_bold=True)
+        PDFGenerator._draw_row(pdf, "Electricity Duty", f"Rs. {res['duty']:.2f}")
+        PDFGenerator._draw_row(pdf, "Fixed Charge", f"Rs. {res['fc']:.2f}")
+        PDFGenerator._draw_row(pdf, "[A] TOTAL ACTUAL MONTHLY CHARGES", f"Rs. {res['shadow_bill']:.2f}", is_bold=True, fill=True)
+        pdf.ln(5)
+
+        # --- SECTION B: DAILY DEDUCTIONS ---
+        PDFGenerator._draw_section_header(pdf, "B. DAILY PREPAID DEDUCTIONS (ALREADY PAID)")
+        PDFGenerator._draw_row(pdf, "Total Daily Energy Deducted", f"Rs. {res['daily_energy']:.2f}")
+        PDFGenerator._draw_row(pdf, "Total Daily Fixed Deducted", f"Rs. {res['daily_fc']:.2f}")
+        PDFGenerator._draw_row(pdf, "Total Daily Duty Deducted", f"Rs. {res['daily_duty']:.2f}")
+        PDFGenerator._draw_row(pdf, "[B] TOTAL ALREADY DEDUCTED", f"Rs. {res['daily_deducted']:.2f}", is_bold=True, fill=True)
+        pdf.ln(5)
+
+        # --- SECTION C: TRUE-UP ---
+        PDFGenerator._draw_section_header(pdf, "C. TRUE-UP SETTLEMENT")
+        
+        pdf.set_font("Arial", 'B', 10)
+        pdf.set_fill_color(220, 220, 220)
+        pdf.cell(70, 7, "  Component", border=1, fill=True)
+        pdf.cell(40, 7, "Actual (A)  ", border=1, align='R', fill=True)
+        pdf.cell(40, 7, "Deducted (B)  ", border=1, align='R', fill=True)
+        pdf.cell(40, 7, "Difference  ", border=1, ln=True, align='R', fill=True)
+        
+        PDFGenerator._draw_row(pdf, "Energy Charge", f"{res['net_ec']:.2f}", f"{res['daily_energy']:.2f}", f"{(res['net_ec'] - res['daily_energy']):.2f}")
+        PDFGenerator._draw_row(pdf, "Fixed Charge", f"{res['fc']:.2f}", f"{res['daily_fc']:.2f}", f"{(res['fc'] - res['daily_fc']):.2f}")
+        PDFGenerator._draw_row(pdf, "Duty", f"{res['duty']:.2f}", f"{res['daily_duty']:.2f}", f"{(res['duty'] - res['daily_duty']):.2f}")
+        
+        diff = res['shadow_bill'] - res['daily_deducted']
+        pdf.set_font("Arial", 'B', 11)
+        adj_text = f"DEBIT of Rs. {diff:.2f}" if diff > 0 else f"CREDIT of Rs. {abs(diff):.2f}" if diff < 0 else "NIL"
+        pdf.cell(190, 8, f"  Net True-Up Adjustment: {adj_text} applied to wallet.", border=1, ln=True)
+        pdf.ln(5)
+
+        # --- SECTION D: LEDGER ---
+        PDFGenerator._draw_section_header(pdf, "D. PREPAID FINANCIAL LEDGER")
+        PDFGenerator._draw_row(pdf, "Closing Arrear Balance:", f"Rs. {consumer.arrear_balance:.2f}")
+        PDFGenerator._draw_row(pdf, "Closing Wallet Balance:", f"Rs. {consumer.wallet_balance:.2f}", is_bold=True, fill=True)
+        
+        pdf.ln(8)
+        pdf.set_font("Arial", 'I', 8)
+        pdf.cell(0, 5, "This is a system-generated settlement statement. Please maintain sufficient wallet balance availability.", ln=True, align='C')
+
+        # Call the new clean bytes method
+        return PDFGenerator._get_clean_pdf_bytes(pdf)
 # ==========================================
-# 1. DATA MANAGER (In-Memory DB)
+# 1. DATA MANAGER
 # ==========================================
 class DataManager:
     @staticmethod
@@ -107,7 +257,6 @@ class DataManager:
 # ==========================================
 # 2. CORE LOGIC & ENGINES
 # ==========================================
-
 class Consumer:
     def __init__(self, consumer_id, name, address, category_id, wallet, arrear, load, installment, initial_reading, billing_month):
         self.consumer_id = consumer_id
@@ -155,42 +304,70 @@ class PaymentEngine:
 
 class SlabEngine:
     @staticmethod
-    def calculate_energy_charge(units, slabs):
+    def calculate_energy_charge_with_breakdown(units, slabs):
         sorted_slabs = sorted(slabs, key=lambda x: x['Upto KWh'])
         charge = 0.0
         remaining_units = units
         prev_limit = 0
+        breakdown = []
+        
         for slab in sorted_slabs:
             slab_size = slab['Upto KWh'] - prev_limit
             if remaining_units <= 0: break
             units_in_slab = min(remaining_units, slab_size)
-            charge += units_in_slab * slab['Rate (₹)']
+            cost = units_in_slab * slab['Rate (₹)']
+            charge += cost
+            
+            upper_label = "Above" if slab['Upto KWh'] > 90000 else f"{slab['Upto KWh']}"
+            breakdown.append({
+                "desc": f"{prev_limit+1}-{upper_label} Units @ Rs.{slab['Rate (₹)']}",
+                "charge": cost
+            })
+            
             remaining_units -= units_in_slab
             prev_limit = slab['Upto KWh']
-        return charge
+            
+        return charge, breakdown
 
 class MigrationEngine:
     @staticmethod
-    def migrate(old_acc, name, address, category_id, old_arrear, security_dep, load, prev_billed_read, migration_read, migration_date, recovery_days=365):
-        unbilled_units = max(0, migration_read - prev_billed_read)
+    def migrate(old_acc, name, address, category_id, old_arrear, security_dep, load, prev_r, mig_r, mig_date, recovery_days=365):
+        unbilled_units = max(0, mig_r - prev_r)
         tariff = DataManager.get_tariff(category_id)
         
-        unbilled_charge = SlabEngine.calculate_energy_charge(unbilled_units, tariff['slabs'])
-        total_debt = float(old_arrear) + unbilled_charge
+        # Calculate with breakdown for the PDF
+        gross_ec, slab_breakdown = SlabEngine.calculate_energy_charge_with_breakdown(unbilled_units, tariff['slabs'])
+        subsidy = unbilled_units * tariff.get('subsidy_rate', 0.0)
+        net_ec = max(0, gross_ec - subsidy)
+        
+        # Assume 30 days proration for migration unbilled period simplistically
+        fc = tariff['fixed_charge']
+        duty = (net_ec + fc) * tariff['duty_rate']
+        
+        total_unbilled = net_ec + fc + duty
+        total_debt = float(old_arrear) + total_unbilled
         
         net_balance = total_debt - float(security_dep)
         new_wallet = abs(net_balance) if net_balance < 0 else 0.0
         new_arrear = net_balance if net_balance > 0 else 0.0
         inst_amt = round(new_arrear / recovery_days, 2) if new_arrear > 0 else 0
         
-        start_month = migration_date.strftime("%Y-%m")
-        c = Consumer(f"PRE-{old_acc}", name, address, category_id, new_wallet, new_arrear, load, {"daily": inst_amt, "recovery_days": recovery_days}, migration_read, start_month)
+        start_month = mig_date.strftime("%Y-%m")
+        c = Consumer(f"PRE-{old_acc}", name, address, category_id, new_wallet, new_arrear, load, {"daily": inst_amt, "recovery_days": recovery_days}, mig_r, start_month)
         
-        DataManager.add_ledger_entry(migration_date, c.consumer_id, f"Unbilled Conv. ({unbilled_units} units)", -unbilled_charge, "INFO", new_wallet)
+        DataManager.add_ledger_entry(mig_date, c.consumer_id, f"Unbilled Conv. ({unbilled_units} units)", -total_unbilled, "INFO", new_wallet)
         if new_wallet > 0:
-            DataManager.add_ledger_entry(migration_date, c.consumer_id, "Opening Balance (Sec Dep Adj)", new_wallet, "CREDIT", new_wallet)
+            DataManager.add_ledger_entry(mig_date, c.consumer_id, "Opening Balance (Sec Dep Adj)", new_wallet, "CREDIT", new_wallet)
         
-        return c, unbilled_units, unbilled_charge
+        # Return dict of details specifically for PDF generation
+        pdf_details = {
+            "prev_r": prev_r, "mig_r": mig_r, "mig_date": str(mig_date), "units": unbilled_units,
+            "slab_breakdown": slab_breakdown, "gross_ec": gross_ec, "subsidy": subsidy,
+            "fc": fc, "duty": duty, "total_unbilled": total_unbilled, "old_arrear": old_arrear,
+            "sec_dep": security_dep, "rec_days": recovery_days
+        }
+        
+        return c, pdf_details
 
 class PrepaidDailyBilling:
     def run(self, consumer, current_kwh, max_demand, date_val, is_meter_change=False, is_non_com=False):
@@ -207,22 +384,13 @@ class PrepaidDailyBilling:
         remarks = []
         days_in_month = calendar.monthrange(dt.year, dt.month)[1]
         
-        # --- NON-COM LOGIC (FIXED CHARGE ONLY) ---
         if is_non_com:
-            units_consumed = 0
-            gross_ec = 0.0
-            subsidy = 0.0
-            net_ec = 0.0
-            penalty = 0.0
+            units_consumed, gross_ec, subsidy, net_ec, penalty = 0, 0.0, 0.0, 0.0, 0.0
             fc = tariff['fixed_charge'] / days_in_month
             duty = fc * tariff['duty_rate']
             remarks.append("Non-Com (Fixed Charge Only)")
-            
-            # Keep reading static
-            if not is_meter_change:
-                current_kwh = consumer.last_reading
+            if not is_meter_change: current_kwh = consumer.last_reading
         else:
-            # --- NORMAL COMMUNICATING LOGIC ---
             units_consumed = current_kwh - consumer.last_reading
             if units_consumed < 0: return {"error": "Negative Consumption. Check reading."}
             
@@ -249,8 +417,7 @@ class PrepaidDailyBilling:
         
         consumer.wallet_balance -= total_deduction
         consumer.arrear_balance -= inst
-        if not is_meter_change:
-            consumer.last_reading = current_kwh
+        if not is_meter_change: consumer.last_reading = current_kwh
         
         # D&R Logic
         if consumer.wallet_balance < 0:
@@ -262,8 +429,6 @@ class PrepaidDailyBilling:
                 consumer.status = "DISCONNECTED"
                 remarks.append("ACTION: Power Disconnected")
                 consumer.amendments.append({"Date": date_str, "Type": "Status", "Details": "ACTIVE -> DISCONNECTED"})
-            else:
-                remarks.append("Status: DISCONNECTED")
         
         desc = "Daily DCC Bill" if not is_meter_change else "Meter Changeout Final Bill"
         DataManager.add_ledger_entry(date_str, consumer.consumer_id, desc, -total_deduction, "DEBIT", consumer.wallet_balance)
@@ -284,7 +449,6 @@ class MonthlySettlementEngine:
     def run_settlement(consumer):
         month_str = consumer.current_billing_month
         
-        # Idempotency lock
         if any(s['month'] == month_str and s['consumer_id'] == consumer.consumer_id for s in st.session_state.settlements):
             return {"status": "FAILED", "reason": f"Settlement for {month_str} already posted."}
 
@@ -293,7 +457,8 @@ class MonthlySettlementEngine:
         
         total_units = sum(l['Units'] for l in logs) if logs else 0
         
-        gross_ec = SlabEngine.calculate_energy_charge(total_units, tariff['slabs'])
+        # Exact slab calculation
+        gross_ec, _ = SlabEngine.calculate_energy_charge_with_breakdown(total_units, tariff['slabs'])
         total_subsidy = total_units * tariff.get('subsidy_rate', 0.0)
         net_ec = max(0, gross_ec - total_subsidy)
         
@@ -301,7 +466,13 @@ class MonthlySettlementEngine:
         duty = (net_ec + fixed_charge) * tariff['duty_rate']
         
         shadow_bill = net_ec + fixed_charge + duty
-        daily_deducted = sum(l['Net EC'] + l['FC'] + l['Duty'] for l in logs) if logs else 0
+        
+        # Granular sum of what was ALREADY deducted
+        daily_energy = sum(l['Net EC'] for l in logs) if logs else 0
+        daily_fc = sum(l['FC'] for l in logs) if logs else 0
+        daily_duty = sum(l['Duty'] for l in logs) if logs else 0
+        daily_deducted = daily_energy + daily_fc + daily_duty
+        
         adjustment = shadow_bill - daily_deducted
         
         status = "SUCCESS"
@@ -312,7 +483,6 @@ class MonthlySettlementEngine:
             DataManager.add_ledger_entry(datetime.now().strftime("%Y-%m-%d"), consumer.consumer_id, 
                                          f"Monthly True-Up Adj ({month_str})", -adjustment, type_, consumer.wallet_balance)
 
-        # Post Invoice
         invoice_desc = f"📜 INVOICE POSTED: {month_str} | Units: {total_units} | Total Bill: ₹{round(shadow_bill,2)}"
         DataManager.add_ledger_entry(datetime.now().strftime("%Y-%m-%d"), consumer.consumer_id, invoice_desc, 0.0, "INVOICE", consumer.wallet_balance)
 
@@ -323,10 +493,14 @@ class MonthlySettlementEngine:
         consumer.current_billing_month = f"{y:04d}-{m:02d}"
 
         DataManager.save_consumer(consumer)
+        
+        # Pass rich data for PDF
         res = {
             "month": month_str, "consumer_id": consumer.consumer_id, "units": total_units,
-            "shadow_bill": round(shadow_bill, 2), "daily_deducted": round(daily_deducted, 2),
-            "adjustment": round(adjustment, 2), "status": status, "next_billing_month": consumer.current_billing_month
+            "gross_ec": gross_ec, "subsidy": total_subsidy, "net_ec": net_ec, "fc": fixed_charge, "duty": duty,
+            "shadow_bill": shadow_bill, 
+            "daily_energy": daily_energy, "daily_fc": daily_fc, "daily_duty": daily_duty, "daily_deducted": daily_deducted,
+            "adjustment": adjustment, "status": status, "next_billing_month": consumer.current_billing_month
         }
         st.session_state.settlements.append(res)
         return res
@@ -338,7 +512,7 @@ st.set_page_config(page_title="VoltEngine Pro", layout="wide", page_icon="⚡")
 DataManager.init()
 
 if not HAS_FPDF:
-    st.sidebar.warning("⚠️ FPDF library missing. PDF downloads will not work. Run `pip install fpdf` in your server.")
+    st.sidebar.warning("⚠️ FPDF library missing. PDF downloads will not work. Run `pip install fpdf2` in your server.")
 
 st.title("⚡ VoltEngine: Billing & Recovery Simulator")
 
@@ -366,20 +540,15 @@ with tabs[1]:
     curr_r = c4.number_input("Reading on Migration Day", value=450.0)
     
     if st.button("Migrate to Prepaid"):
-        c, un_units, un_charge = MigrationEngine.migrate(acc, "John Doe", "Bihar", cat, arr, sec, ld, prev_r, curr_r, mig_date)
+        c, pdf_details = MigrationEngine.migrate(acc, "John Doe", "Patna, Bihar", cat, arr, sec, ld, prev_r, curr_r, mig_date)
         DataManager.save_consumer(c)
         st.success(f"Migrated: {c.consumer_id}")
         
-        # Prepare Data for PDF
-        det = {"Migration Date": str(mig_date), "Prev Reading": str(prev_r), "Migration Reading": str(curr_r), "Unbilled Units": str(un_units)}
-        fin = {"Old Arrears": str(arr), "Unbilled Charge": str(round(un_charge,2)), "Total Debt": str(round(arr+un_charge,2)), 
-               "Security Deposit": f"-{sec}", "Opening Arrear": str(c.arrear_balance), "Opening Wallet": str(c.wallet_balance)}
-        
-        st.session_state[f"pdf_{c.consumer_id}_mig"] = PDFGenerator.create_bill("POSTPAID TO PREPAID CONVERSION BILL", c, det, fin)
+        # Generate and store the beautiful PDF
+        st.session_state[f"pdf_{c.consumer_id}_mig"] = PDFGenerator.generate_conversion_bill(c, pdf_details)
 
-    # Show Download Button if migration PDF exists
     if f"pdf_PRE-{acc}_mig" in st.session_state and isinstance(st.session_state[f"pdf_PRE-{acc}_mig"], bytes):
-        st.download_button("⬇️ Download Conversion Bill PDF", data=st.session_state[f"pdf_PRE-{acc}_mig"], 
+        st.download_button("⬇️ Download Final Conversion Bill PDF", data=st.session_state[f"pdf_PRE-{acc}_mig"], 
                            file_name=f"Conversion_Bill_{acc}.pdf", mime="application/pdf")
 
 # --- TAB 3: PROFILE ---
@@ -503,14 +672,10 @@ with tabs[7]:
                 st.success("Invoice Generated!")
                 st.json(res)
                 
-                # Prepare Data for PDF
-                det = {"Billing Month": res['month'], "Total Units Consumed": str(res['units'])}
-                fin = {"Actual Shadow Bill": str(res['shadow_bill']), "Already Deducted Daily": str(res['daily_deducted']), 
-                       "True-up Adjustment": str(res['adjustment']), "Final Wallet Balance": str(c.wallet_balance), "Final Arrear Balance": str(c.arrear_balance)}
-                
-                st.session_state[f"pdf_{c.consumer_id}_inv_{res['month']}"] = PDFGenerator.create_bill(f"MONTHLY SETTLEMENT INVOICE: {res['month']}", c, det, fin)
+                # Create the Evolved Monthly Settlement PDF
+                st.session_state[f"pdf_{c.consumer_id}_inv_{res['month']}"] = PDFGenerator.generate_settlement_bill(c, res)
 
-        # Show Download Button if the settlement PDF exists in memory
+        # Show Download Button
         settled_months = [s['month'] for s in st.session_state.settlements if s['consumer_id'] == selected_c_id]
         for m in settled_months:
             key = f"pdf_{c.consumer_id}_inv_{m}"
