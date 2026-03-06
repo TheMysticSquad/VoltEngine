@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import calendar
+import tempfile
+import os
 
 # Attempt to import FPDF for PDF Generation
 try:
@@ -10,8 +12,6 @@ try:
 except ImportError:
     HAS_FPDF = False
     FPDF = None
-import tempfile
-import os
 
 # ==========================================
 # 0. PDF GENERATOR UTILITY (FILE-BUFFER FIX)
@@ -59,10 +59,9 @@ class PDFGenerator:
             return pdf_bytes
             
         finally:
-            # The 'finally' block GUARANTEES the file is deleted from the 
-            # cloud server, even if the code crashes on the line above!
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+
     @staticmethod
     def generate_conversion_bill(consumer, details):
         if not HAS_FPDF: return b"FPDF not installed."
@@ -138,7 +137,6 @@ class PDFGenerator:
         pdf.cell(190, 6, f"   * Recovery Days: {details['rec_days']} Days", ln=True)
         pdf.cell(190, 6, f"   * Installment Per Day: Rs. {consumer.installment.get('daily', 0):.2f}", ln=True)
 
-        # Call the new clean bytes method
         return PDFGenerator._get_clean_pdf_bytes(pdf)
 
     @staticmethod
@@ -212,8 +210,8 @@ class PDFGenerator:
         pdf.set_font("Arial", 'I', 8)
         pdf.cell(0, 5, "This is a system-generated settlement statement. Please maintain sufficient wallet balance availability.", ln=True, align='C')
 
-        # Call the new clean bytes method
         return PDFGenerator._get_clean_pdf_bytes(pdf)
+
 # ==========================================
 # 1. DATA MANAGER
 # ==========================================
@@ -335,12 +333,10 @@ class MigrationEngine:
         unbilled_units = max(0, mig_r - prev_r)
         tariff = DataManager.get_tariff(category_id)
         
-        # Calculate with breakdown for the PDF
         gross_ec, slab_breakdown = SlabEngine.calculate_energy_charge_with_breakdown(unbilled_units, tariff['slabs'])
         subsidy = unbilled_units * tariff.get('subsidy_rate', 0.0)
         net_ec = max(0, gross_ec - subsidy)
         
-        # Assume 30 days proration for migration unbilled period simplistically
         fc = tariff['fixed_charge']
         duty = (net_ec + fc) * tariff['duty_rate']
         
@@ -359,7 +355,6 @@ class MigrationEngine:
         if new_wallet > 0:
             DataManager.add_ledger_entry(mig_date, c.consumer_id, "Opening Balance (Sec Dep Adj)", new_wallet, "CREDIT", new_wallet)
         
-        # Return dict of details specifically for PDF generation
         pdf_details = {
             "prev_r": prev_r, "mig_r": mig_r, "mig_date": str(mig_date), "units": unbilled_units,
             "slab_breakdown": slab_breakdown, "gross_ec": gross_ec, "subsidy": subsidy,
@@ -457,7 +452,6 @@ class MonthlySettlementEngine:
         
         total_units = sum(l['Units'] for l in logs) if logs else 0
         
-        # Exact slab calculation
         gross_ec, _ = SlabEngine.calculate_energy_charge_with_breakdown(total_units, tariff['slabs'])
         total_subsidy = total_units * tariff.get('subsidy_rate', 0.0)
         net_ec = max(0, gross_ec - total_subsidy)
@@ -467,7 +461,6 @@ class MonthlySettlementEngine:
         
         shadow_bill = net_ec + fixed_charge + duty
         
-        # Granular sum of what was ALREADY deducted
         daily_energy = sum(l['Net EC'] for l in logs) if logs else 0
         daily_fc = sum(l['FC'] for l in logs) if logs else 0
         daily_duty = sum(l['Duty'] for l in logs) if logs else 0
@@ -486,7 +479,6 @@ class MonthlySettlementEngine:
         invoice_desc = f"📜 INVOICE POSTED: {month_str} | Units: {total_units} | Total Bill: ₹{round(shadow_bill,2)}"
         DataManager.add_ledger_entry(datetime.now().strftime("%Y-%m-%d"), consumer.consumer_id, invoice_desc, 0.0, "INVOICE", consumer.wallet_balance)
 
-        # Advance Billing Cycle
         y, m = map(int, month_str.split('-'))
         m = 1 if m == 12 else m + 1
         y = y + 1 if m == 1 else y
@@ -494,7 +486,6 @@ class MonthlySettlementEngine:
 
         DataManager.save_consumer(consumer)
         
-        # Pass rich data for PDF
         res = {
             "month": month_str, "consumer_id": consumer.consumer_id, "units": total_units,
             "gross_ec": gross_ec, "subsidy": total_subsidy, "net_ec": net_ec, "fc": fixed_charge, "duty": duty,
@@ -506,20 +497,60 @@ class MonthlySettlementEngine:
         return res
 
 # ==========================================
-# 3. STREAMLIT UI
+# 3. STREAMLIT UI & GUIDE MODAL
 # ==========================================
 st.set_page_config(page_title="VoltEngine Pro", layout="wide", page_icon="⚡")
 DataManager.init()
+
+# --- GUIDE POPUP FUNCTION ---
+@st.dialog("📖 VoltEngine Quick Start Guide")
+def show_guide():
+    st.markdown("""
+    ### **Welcome to the VoltEngine Simulator!**
+    This tool allows you to simulate the complete financial lifecycle of a Smart Prepaid Utility Consumer.
+    
+    **Follow these 4 steps to test the engine:**
+    
+    **1. 🔄 Migration (Postpaid to Prepaid)**
+    * Go to the **Migration** tab.
+    * Convert a legacy user to prepaid by calculating their unbilled units and adjusting their security deposit. 
+    * *Outputs:* A downloadable Conversion Bill PDF.
+    
+    **2. 📟 Daily Readings (DCC Engine)**
+    * Go to the **Readings** tab.
+    * Simulate smart meter daily pushes. Watch the engine deduct micro-payments (energy, fixed charge, and daily arrear installments) from the wallet.
+    
+    **3. 💰 Finance & Ledger**
+    * Check the **DCC & Ledger** tab to audit the financial tracking.
+    * Go to **Finance** to process a recharge if the wallet drops below zero and triggers a Disconnection.
+    
+    **4. 📅 Monthly Settlement (True-Up)**
+    * Go to the **Settlement** tab to close the billing month. 
+    * The engine will reconcile daily low-slab deductions against the actual monthly telescopic slab cost.
+    * *Outputs:* A downloadable Monthly True-Up Invoice PDF.
+    """)
+
+# Trigger guide automatically on first load
+if 'guide_shown' not in st.session_state:
+    st.session_state.guide_shown = True
+    show_guide()
+
+# Sidebar configuration
+st.sidebar.title("⚡ VoltEngine Menu")
+active_consumers = list(st.session_state.consumers.keys())
+selected_c_id = st.sidebar.selectbox("Active Consumer", ["Select"] + active_consumers)
+st.sidebar.divider()
+
+# Button to trigger the guide again manually
+if st.sidebar.button("📖 Open Quick Start Guide", use_container_width=True):
+    show_guide()
 
 if not HAS_FPDF:
     st.sidebar.warning("⚠️ FPDF library missing. PDF downloads will not work. Run `pip install fpdf2` in your server.")
 
 st.title("⚡ VoltEngine: Billing & Recovery Simulator")
 
-active_consumers = list(st.session_state.consumers.keys())
-selected_c_id = st.sidebar.selectbox("Active Consumer", ["Select"] + active_consumers)
-
-tabs = st.tabs(["⚙️ Masters", "🔄 Migration", "👤 Profile", "🛠️ Services", "📟 Readings", "📊 DCC", "💰 Finance", "📅 Settlement"])
+tabs = st.tabs(["⚙️ Masters", "🔄 Migration", "👤 Profile", "🛠️ Services", "📟 Readings", "📊 DCC & Ledger", "💰 Finance", "📅 Settlement"])
 
 # --- TAB 1: CATEGORY ---
 with tabs[0]:
@@ -543,8 +574,6 @@ with tabs[1]:
         c, pdf_details = MigrationEngine.migrate(acc, "John Doe", "Patna, Bihar", cat, arr, sec, ld, prev_r, curr_r, mig_date)
         DataManager.save_consumer(c)
         st.success(f"Migrated: {c.consumer_id}")
-        
-        # Generate and store the beautiful PDF
         st.session_state[f"pdf_{c.consumer_id}_mig"] = PDFGenerator.generate_conversion_bill(c, pdf_details)
 
     if f"pdf_PRE-{acc}_mig" in st.session_state and isinstance(st.session_state[f"pdf_PRE-{acc}_mig"], bytes):
@@ -672,10 +701,8 @@ with tabs[7]:
                 st.success("Invoice Generated!")
                 st.json(res)
                 
-                # Create the Evolved Monthly Settlement PDF
                 st.session_state[f"pdf_{c.consumer_id}_inv_{res['month']}"] = PDFGenerator.generate_settlement_bill(c, res)
 
-        # Show Download Button
         settled_months = [s['month'] for s in st.session_state.settlements if s['consumer_id'] == selected_c_id]
         for m in settled_months:
             key = f"pdf_{c.consumer_id}_inv_{m}"
